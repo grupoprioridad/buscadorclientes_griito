@@ -1,0 +1,29 @@
+# ────────────────────────────────────────────────────────────
+# CRON - Búsqueda y contacto de clientes potenciales Griito
+# ────────────────────────────────────────────────────────────
+# Ejecutar Lunes a Viernes a las 09:00 AM
+# Busca 50 leads y envía correos de presentación
+# Incluye control de calidad semanal automático
+#
+# Requisitos:
+#   1. Exportar ANTHROPIC_API_KEY en el crontab
+#   2. Usar ruta absoluta al venv y al script
+#
+# Instalación:
+#   crontab -e
+#   Pegar la línea de abajo (ajustando rutas)
+#
+# ────────────────────────────────────────────────────────────
+
+# Lunes a Viernes 09:00 AM
+0 9 * * 1-5 cd /var/www/buscadorclientes/griito && ANTHROPIC_API_KEY="sk-ant-..." /tmp/griito_venv/bin/python3 scripts/find_and_email_clients.py >> data/cron.log 2>&1
+
+# ────────────────────────────────────────────────────────────
+# Alternativas:
+# ────────────────────────────────────────────────────────────
+
+# Sólo generar leads sin enviar correos (prueba)
+# 0 9 * * 1-5 cd /path/to/griito && ANTHROPIC_API_KEY="..." /venv/bin/python3 scripts/find_and_email_clients.py --dry-run
+
+# Forzar control de calidad manual
+# 0 12 * * 1 cd /path/to/griito && ANTHROPIC_API_KEY="..." /venv/bin/python3 scripts/find_and_email_clients.py --skip-qc

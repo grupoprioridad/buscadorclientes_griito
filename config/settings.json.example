@@ -1,0 +1,51 @@
+{
+  "email": {
+    "from_name": "Jacinta - Griito",
+    "from_email": "jacinta@prioridad.cl",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_username": "TU_EMAIL",
+    "smtp_password": "TU_PASSWORD",
+    "use_tls": true
+  },
+  "claude": {
+    "model": "claude-haiku-4-5",
+    "max_tokens": 2000
+  },
+  "script": {
+    "leads_per_run": 50,
+    "leads_per_sector": 10,
+    "min_days_before_repeat_sector": 7,
+    "log_level": "INFO",
+    "dry_run": true
+  },
+  "quality_control": {
+    "enabled": true,
+    "model": "claude-sonnet-4-6",
+    "sample_size": 10,
+    "alert_threshold": 0.2,
+    "alert_email": "esteban@prioridad.cl",
+    "min_days_between_checks": 7
+  },
+  "company_info": {
+    "name": "Griito",
+    "website": "https://griito.com",
+    "description": "Plataforma de contactabilidad telefónica que permite comunicar con voz, a escala, sin esfuerzo.",
+    "industries": [
+      "call_centers",
+      "seguros",
+      "bancos_fintech",
+      "salud_clinicas",
+      "bienes_raices",
+      "cobranzas",
+      "telecomunicaciones",
+      "retail_ecommerce",
+      "educacion",
+      "viajes_turismo",
+      "automotriz",
+      "servicios_publicos",
+      "agencias_marketing",
+      "logistica_delivery"
+    ]
+  }
+}
