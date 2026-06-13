@@ -21,7 +21,7 @@
   },
   "quality_control": {
     "enabled": true,
-    "model": "claude-sonnet-4-6",
+    "model": "claude-opus-4-8",
     "sample_size": 10,
     "alert_threshold": 0.2,
     "alert_email": "esteban@prioridad.cl",
