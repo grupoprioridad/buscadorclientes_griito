@@ -21,11 +21,12 @@ import smtplib
 import logging
 import argparse
 import random
+import time
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import anthropic
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -232,35 +233,90 @@ def record_sector_search(conn, sector: str):
     conn.commit()
 
 
-def fetch_leads_from_claude(client: anthropic.Anthropic, config: dict, sector: str, count: int) -> List[Dict]:
-    sector_label = SECTOR_LABELS.get(sector, sector)
-    prompt = CLAUDE_USER_PROMPT.format(count=count, sector=sector_label)
-    model = config["claude"]["model"]
+BATCH_TIMEOUT = 300  # 5 min max espera por batch
 
-    logger.info(f"Consultando Claude API ({model}) para sector: {sector_label} ({count} leads)")
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=4000,
-        system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    content = response.content[0].text.strip()
-
+def _parse_json_response(content: str) -> List[Dict]:
     json_start = content.find("[")
     json_end = content.rfind("]") + 1
     if json_start >= 0 and json_end > json_start:
         content = content[json_start:json_end]
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return []
+
+
+def _build_batch_requests(sectors: List[str], config: dict, count: int) -> List[dict]:
+    model = config["claude"]["model"]
+    requests = []
+    for sector in sectors:
+        sector_label = SECTOR_LABELS.get(sector, sector)
+        prompt = CLAUDE_USER_PROMPT.format(count=count, sector=sector_label)
+        requests.append({
+            "custom_id": f"sector_{sector}",
+            "params": {
+                "model": model,
+                "max_tokens": 4000,
+                "system": CLAUDE_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        })
+    return requests
+
+
+def _wait_for_batch(client: anthropic.Anthropic, batch_id: str, timeout: int = BATCH_TIMEOUT) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        batch = client.messages.batches.retrieve(batch_id)
+        status = batch.processing_status
+        counts = batch.request_counts
+        logger.info(f"Batch {batch_id}: {status} (ok={counts.succeeded}, err={counts.errored}, pend={counts.processing})")
+        if status == "ended":
+            return True
+        if status == "expired":
+            logger.error(f"Batch {batch_id} expiró")
+            return False
+        time.sleep(10)
+    logger.error(f"Batch {batch_id} timed out after {timeout}s")
+    return False
+
+
+def _results_to_dict(batch_results) -> Dict[str, List[Dict]]:
+    result_map = {}
+    for result in batch_results:
+        custom_id = result.custom_id
+        if result.result.type == "succeeded":
+            content = result.result.message.content[0].text.strip()
+            leads = _parse_json_response(content)
+            result_map[custom_id] = leads
+        else:
+            logger.error(f"Error en batch request {custom_id}: {result.result.error}")
+            result_map[custom_id] = []
+    return result_map
+
+
+def batch_fetch_leads(client: anthropic.Anthropic, config: dict, sectors: List[str], count: int) -> Dict[str, List[Dict]]:
+    if not sectors:
+        return {}
+
+    requests = _build_batch_requests(sectors, config, count)
+    logger.info(f"Enviando batch con {len(requests)} sectores ({config['claude']['model']})...")
 
     try:
-        leads = json.loads(content)
-        logger.info(f"Claude devolvió {len(leads)} leads")
-        return leads
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decodificando JSON de Claude: {e}")
-        logger.debug(f"Respuesta raw: {content[:500]}")
-        return []
+        batch = client.messages.batches.create(requests=requests)
+    except Exception as e:
+        logger.error(f"Error creando batch: {e}")
+        return {}
+
+    logger.info(f"Batch {batch.id} creado. Esperando resultados...")
+
+    if not _wait_for_batch(client, batch.id):
+        logger.error("Batch no completó a tiempo, se omite esta ejecución")
+        return {}
+
+    results = client.messages.batches.results(batch.id)
+    return _results_to_dict(results)
 
 
 def filter_new_leads(conn, leads: List[Dict], sector: str) -> List[Dict]:
@@ -481,6 +537,39 @@ def send_alert_email(config: dict, subject: str, body: str):
         logger.error(f"Error enviando alerta: {e}")
 
 
+def batch_qc_evaluate(client: anthropic.Anthropic, config: dict, sample: List[Dict]) -> Optional[List[Dict]]:
+    qc_model = config["quality_control"]["model"]
+    leads_json = "\n".join(QC_SAMPLE_TEMPLATE.format(**s) for s in sample)
+    prompt = QC_USER_PROMPT.format(leads_json=leads_json)
+
+    requests = [{
+        "custom_id": "qc_eval",
+        "params": {
+            "model": qc_model,
+            "max_tokens": 4000,
+            "system": QC_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    }]
+
+    try:
+        batch = client.messages.batches.create(requests=requests)
+        logger.info(f"Batch QC {batch.id} creado. Esperando...")
+        if not _wait_for_batch(client, batch.id):
+            return None
+        results = client.messages.batches.results(batch.id)
+        for r in results:
+            if r.custom_id == "qc_eval" and r.result.type == "succeeded":
+                content = r.result.message.content[0].text.strip()
+                scores = _parse_json_response(content)
+                logger.info(f"QC: {len(scores)} evaluaciones recibidas")
+                return scores
+        return None
+    except Exception as e:
+        logger.error(f"Error en batch QC: {e}")
+        return None
+
+
 def run_quality_check(client: anthropic.Anthropic, config: dict, conn) -> bool:
     qc = config.get("quality_control", {})
     if not qc.get("enabled", True):
@@ -505,29 +594,11 @@ def run_quality_check(client: anthropic.Anthropic, config: dict, conn) -> bool:
         logger.info("QC: sin leads recientes para evaluar, se omite")
         return False
 
-    logger.info(f"QC: evaluando {len(sample)} leads con {qc_model}...")
-    leads_json = "\n".join(
-        QC_SAMPLE_TEMPLATE.format(**s) for s in sample
-    )
-    prompt = QC_USER_PROMPT.format(leads_json=leads_json)
+    logger.info(f"QC: evaluando {len(sample)} leads con {qc_model} (batch)...")
 
-    try:
-        response = client.messages.create(
-            model=qc_model,
-            max_tokens=4000,
-            system=QC_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = response.content[0].text.strip()
-        json_start = content.find("[")
-        json_end = content.rfind("]") + 1
-        if json_start >= 0 and json_end > json_start:
-            content = content[json_start:json_end]
-
-        scores = json.loads(content)
-        logger.info(f"QC: Claude devolvió {len(scores)} evaluaciones")
-    except Exception as e:
-        logger.error(f"QC: error evaluando con Claude: {e}")
+    scores = batch_qc_evaluate(client, config, sample)
+    if scores is None:
+        logger.error("QC: falló la evaluación batch")
         return False
 
     if not scores:
@@ -632,70 +703,84 @@ def main():
 
     total_sent = 0
     processed_sectors = 0
-    max_sectors = len(config["company_info"]["industries"])
+    max_sectors_total = len(config["company_info"]["industries"])
     sector_override = args.sector
+    template = load_template()
 
-    while total_sent < max_leads and processed_sectors < max_sectors:
+    max_sectors_per_batch = max(1, (max_leads + leads_per_sector - 1) // leads_per_sector)
+
+    while total_sent < max_leads and processed_sectors < max_sectors_total:
+        sectors_to_query = []
         if sector_override:
-            sector = sector_override
+            if sector_override not in sectors_to_query:
+                sectors_to_query.append(sector_override)
         else:
-            sector = get_next_sector(config, conn)
+            for _ in range(max_sectors_per_batch):
+                s = get_next_sector(config, conn)
+                if s and s not in sectors_to_query:
+                    sectors_to_query.append(s)
 
-        if not sector:
+        if not sectors_to_query:
             logger.info("No hay más sectores disponibles")
             break
 
-        processed_sectors += 1
-        sector_label = SECTOR_LABELS.get(sector, sector)
-        logger.info(f"Procesando sector ({processed_sectors}/{max_sectors}): {sector_label}")
+        logger.info(f"Enviando batch de {len(sectors_to_query)} sectores: {[SECTOR_LABELS.get(s,s) for s in sectors_to_query]}")
+        results = batch_fetch_leads(client, config, sectors_to_query, leads_per_sector)
+        if not results:
+            logger.warning("Batch falló, abortando")
+            break
 
-        leads = fetch_leads_from_claude(client, config, sector, leads_per_sector)
-        if not leads:
-            logger.warning(f"No se obtuvieron leads para {sector_label}, pasando al siguiente")
-            if sector_override:
-                break
-            continue
-
-        new_leads = filter_new_leads(conn, leads, sector)
-        save_leads(conn, new_leads, sector)
-        record_sector_search(conn, sector)
-
-        template = load_template()
-        needed = max_leads - total_sent
-
-        for lead in new_leads:
+        for sector in sectors_to_query:
             if total_sent >= max_leads:
                 break
 
-            email = get_lead_email(lead)
-            company_name = lead.get("nombre", "").strip()
-
-            if not email:
-                logger.info(f"Sin email para {company_name}, se omite envío")
-                conn.execute(
-                    "UPDATE leads SET estado = 'sin_email' WHERE nombre = ? AND sector = ?",
-                    (company_name, sector)
-                )
-                conn.commit()
+            key = f"sector_{sector}"
+            leads = results.get(key, [])
+            if not leads:
                 continue
 
-            subject = f"{config['company_info']['name']} - Contactabilidad telefónica para {company_name}"
-            html_body = render_email(template, company_name, sector_label)
+            sector_label = SECTOR_LABELS.get(sector, sector)
+            processed_sectors += 1
 
-            logger.info(f"Enviando correo a {company_name} <{email}>")
-            success = send_email(config, email, company_name, subject, html_body, dry_run)
+            new_leads = filter_new_leads(conn, leads, sector)
+            if not new_leads:
+                continue
 
-            lead_row = conn.execute(
-                "SELECT id FROM leads WHERE nombre = ? AND sector = ?",
-                (company_name, sector)
-            ).fetchone()
+            save_leads(conn, new_leads, sector)
+            record_sector_search(conn, sector)
 
-            if lead_row:
-                record_sent_email(conn, lead_row[0], email, subject, success)
+            for lead in new_leads:
+                if total_sent >= max_leads:
+                    break
 
-            if success:
-                total_sent += 1
-                sync_to_pipeline(lead, sector_label)
+                email = get_lead_email(lead)
+                company_name = lead.get("nombre", "").strip()
+
+                if not email:
+                    conn.execute(
+                        "UPDATE leads SET estado = 'sin_email' WHERE nombre = ? AND sector = ?",
+                        (company_name, sector)
+                    )
+                    conn.commit()
+                    continue
+
+                subject = f"{config['company_info']['name']} - Contactabilidad telefónica para {company_name}"
+                html_body = render_email(template, company_name, sector_label)
+
+                logger.info(f"Enviando correo a {company_name} <{email}>")
+                success = send_email(config, email, company_name, subject, html_body, dry_run)
+
+                lead_row = conn.execute(
+                    "SELECT id FROM leads WHERE nombre = ? AND sector = ?",
+                    (company_name, sector)
+                ).fetchone()
+
+                if lead_row:
+                    record_sent_email(conn, lead_row[0], email, subject, success)
+
+                if success:
+                    total_sent += 1
+                    sync_to_pipeline(lead, sector_label)
 
         if sector_override:
             break
